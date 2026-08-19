@@ -25,7 +25,19 @@ jobs:
             exit 1
           fi
           installer="PokemonStoryBot-$version-Setup.exe"
-          test -f "$installer"
+          shopt -s nullglob
+          installer_parts=("$installer".part-*)
+          if (( ${#installer_parts[@]} == 0 )); then
+            echo "No installer parts were received." >&2
+            exit 1
+          fi
+          for part in "${installer_parts[@]}"; do
+            if (( $(stat --format=%s "$part") > 95000000 )); then
+              echo "Installer part exceeds the safe GitHub file limit: $part" >&2
+              exit 1
+            fi
+          done
+          cat -- "${installer_parts[@]}" > "$installer"
           test -s RELEASE_NOTES.md
           jq -e \
             --arg version "$version" \
@@ -37,8 +49,8 @@ jobs:
              (.installer_url | endswith("/" + $installer))' \
             update-stable.json >/dev/null
           sha256sum --check SHA256SUMS.txt
-          "version=$version" >> "$GITHUB_OUTPUT"
-          "installer=$installer" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "installer=$installer" >> "$GITHUB_OUTPUT"
       - name: Publish release files
         env:
           GH_TOKEN: ${{ github.token }}
