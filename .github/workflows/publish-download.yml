@@ -1,0 +1,70 @@
+name: Publish official download
+
+on:
+  push:
+    branches: [incoming]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-official-download
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate incoming package
+        id: package
+        run: |
+          version="$(jq -r '.version' update-stable.json)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release version: $version" >&2
+            exit 1
+          fi
+          installer="PokemonStoryBot-$version-Setup.exe"
+          test -f "$installer"
+          test -s RELEASE_NOTES.md
+          jq -e \
+            --arg version "$version" \
+            --arg installer "$installer" \
+            '.schema_version == 2 and
+             .version == $version and
+             .signature_algorithm == "ed25519" and
+             (.signature | type == "string" and length > 0) and
+             (.installer_url | endswith("/" + $installer))' \
+            update-stable.json >/dev/null
+          sha256sum --check SHA256SUMS.txt
+          "version=$version" >> "$GITHUB_OUTPUT"
+          "installer=$installer" >> "$GITHUB_OUTPUT"
+      - name: Publish release files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.package.outputs.version }}
+          INSTALLER: ${{ steps.package.outputs.installer }}
+        run: |
+          tag="v$VERSION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" \
+              --title "Pokémon Story Bot $VERSION" \
+              --notes-file RELEASE_NOTES.md \
+              --latest
+          else
+            gh release create "$tag" \
+              --target main \
+              --title "Pokémon Story Bot $VERSION" \
+              --notes-file RELEASE_NOTES.md \
+              --latest
+          fi
+          gh release upload "$tag" \
+            "$INSTALLER" \
+            update-stable.json \
+            SHA256SUMS.txt \
+            --clobber
+      - name: Remove temporary publishing branch
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/incoming"
