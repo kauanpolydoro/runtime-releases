@@ -24,7 +24,7 @@ jobs:
         id: refs
         run: |
           set -euo pipefail
-          remote="https://github.com/$GITHUB_REPOSITORY.git"
+          remote="https://github.com/kauanpolydoro/runtime-release-inbox.git"
           candidate_sha="$(git ls-remote "$remote" refs/heads/incoming-candidate |
             awk '{print $1}')"
           promotion_sha="$(git ls-remote "$remote" refs/heads/incoming-promotion |
@@ -46,6 +46,7 @@ jobs:
           fetch-depth: 1
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          repository: kauanpolydoro/runtime-release-inbox
           ref: ${{ needs.discover.outputs.candidate_sha }}
           path: transport
           persist-credentials: false
@@ -68,7 +69,9 @@ jobs:
           expected_sha="$(jq -r .sha256 transport/CANDIDATE_METADATA.json)"
           installer="PokemonStoryBot-$version-Setup.exe"
           stable_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
-          python3 trusted/.github/scripts/require_newer_semver.py "$version" "$stable_tag"
+          if ! gh release view "v$version" >/dev/null 2>&1; then
+            python3 trusted/.github/scripts/require_newer_semver.py "$version" "$stable_tag"
+          fi
           shopt -s nullglob
           installer_parts=("transport/$installer".part-*)
           if (( ${#installer_parts[@]} == 0 )); then
@@ -136,11 +139,27 @@ jobs:
           set -euo pipefail
           tag="v$VERSION"
           stable_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
-          python3 trusted/.github/scripts/require_newer_semver.py "$VERSION" "$stable_tag"
           if gh release view "$tag" >/dev/null 2>&1; then
-            echo "Candidate $tag already exists; immutable assets are never replaced." >&2
-            exit 1
+            mkdir existing
+            gh release download "$tag" \
+              --pattern "$INSTALLER" \
+              --pattern update-candidate.json \
+              --pattern SHA256SUMS.txt \
+              --pattern CANDIDATE_METADATA.json \
+              --pattern RELEASE_NOTES.md \
+              --dir existing
+            for asset in \
+              "$INSTALLER" \
+              update-candidate.json \
+              SHA256SUMS.txt \
+              CANDIDATE_METADATA.json \
+              RELEASE_NOTES.md; do
+              cmp "package/$asset" "existing/$asset"
+            done
+            echo "Candidate $tag already contains the same immutable assets."
+            exit 0
           fi
+          python3 trusted/.github/scripts/require_newer_semver.py "$VERSION" "$stable_tag"
           gh release create "$tag" \
             "package/$INSTALLER" \
             package/update-candidate.json \
@@ -151,23 +170,6 @@ jobs:
             --title "Pokémon Story Bot $VERSION — candidato" \
             --notes-file package/RELEASE_NOTES.md \
             --prerelease
-      - name: Remove unchanged candidate transport branch
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TRANSPORT_SHA: ${{ needs.discover.outputs.candidate_sha }}
-        run: |
-          set -euo pipefail
-          ref=refs/heads/incoming-candidate
-          current_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/incoming-candidate" \
-            --jq .object.sha)"
-          if [[ "$current_sha" != "$TRANSPORT_SHA" ]]; then
-            echo "Transport branch advanced to $current_sha; preserving it."
-            exit 0
-          fi
-          git -C trusted push origin \
-            --force-with-lease="$ref:$TRANSPORT_SHA" \
-            ":$ref" || echo "Transport branch changed during cleanup; preserving it."
-
   promotion:
     needs: [discover, candidate]
     if: >-
@@ -185,6 +187,7 @@ jobs:
           fetch-depth: 1
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          repository: kauanpolydoro/runtime-release-inbox
           ref: ${{ needs.discover.outputs.promotion_sha }}
           path: transport
           persist-credentials: false
@@ -212,8 +215,16 @@ jobs:
           source_sha="$(jq -r .source_sha transport/PROMOTION_METADATA.json)"
           installer_sha="$(jq -r .installer_sha256 transport/PROMOTION_METADATA.json)"
           stable_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
-          python3 trusted/.github/scripts/require_newer_semver.py "$version" "$stable_tag"
-          test "$(gh release view "$tag" --json isPrerelease --jq .isPrerelease)" = "true"
+          prerelease="$(gh release view "$tag" --json isPrerelease --jq .isPrerelease)"
+          already_promoted=false
+          if [[ "$prerelease" == "true" ]]; then
+            python3 trusted/.github/scripts/require_newer_semver.py "$version" "$stable_tag"
+          elif [[ "$prerelease" == "false" && "$stable_tag" == "$tag" ]]; then
+            already_promoted=true
+          else
+            echo "$tag is neither the current candidate nor the exact stable release." >&2
+            exit 1
+          fi
           mkdir candidate
           gh release download "$tag" \
             --pattern CANDIDATE_METADATA.json \
@@ -258,7 +269,9 @@ jobs:
             -in "$verification_dir/manifest-canonical.json" \
             -sigfile "$verification_dir/manifest-signature.bin"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "already_promoted=$already_promoted" >> "$GITHUB_OUTPUT"
       - name: Promote the same bytes to stable
+        if: steps.promotion.outputs.already_promoted != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.promotion.outputs.version }}
@@ -274,19 +287,3 @@ jobs:
             --title "Pokémon Story Bot $VERSION" \
             --latest \
             --prerelease=false
-      - name: Remove unchanged promotion transport branch
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TRANSPORT_SHA: ${{ needs.discover.outputs.promotion_sha }}
-        run: |
-          set -euo pipefail
-          ref=refs/heads/incoming-promotion
-          current_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/incoming-promotion" \
-            --jq .object.sha)"
-          if [[ "$current_sha" != "$TRANSPORT_SHA" ]]; then
-            echo "Transport branch advanced to $current_sha; preserving it."
-            exit 0
-          fi
-          git -C trusted push origin \
-            --force-with-lease="$ref:$TRANSPORT_SHA" \
-            ":$ref" || echo "Transport branch changed during cleanup; preserving it."
